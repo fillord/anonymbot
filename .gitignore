@@ -24,3 +24,4 @@ logs/
 .idea/
 .vscode/
 .DS_Store
+ecosystem.config.js
