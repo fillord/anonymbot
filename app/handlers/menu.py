@@ -95,43 +95,50 @@ async def process_age(message: Message, state: FSMContext, session: AsyncSession
 async def show_profile(message: Message, session: AsyncSession):
     user, _ = await get_or_create_user(session, message.from_user.id)
     
-    import datetime
     now = datetime.datetime.utcnow()
+    # Проверяем VIP статус
     is_vip = user.vip_until and user.vip_until > now
-    status = "👑 VIP" if is_vip else "Обычный"
+    status = "👑 VIP пользователь" if is_vip else "Обычный статус"
     
-    # Проверяем сброс лимита смены ника (30 дней)
+    # Логика сброса лимита ника (раз в 30 дней)
     if user.last_nickname_change and (now - user.last_nickname_change).days >= 30:
         user.nickname_changes = 0
         await session.commit()
     
-    changes_left = max(0, 20 - user.nickname_changes)
-    nick_display = user.nickname if user.nickname else "Не установлен (Случайный)"
-    
+    # Подготовка данных для текста
     bot_info = await message.bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={message.from_user.id}"
-
     gender_emoji = "👨" if user.gender == "M" else "👩"
-    filter_text = {"M": "Парни 👨", "F": "Девушки 👩", "any": "Все 🌍"}.get(user.search_gender, "Все")
+    filter_text = {"M": "Парни 👨", "F": "Девушки 👩", "any": "Все 🌍"}.get(user.search_gender, "Все 🌍")
     
     text = (
         f"👤 <b>Ваш профиль:</b>\n\n"
-        f"Указано: {gender_emoji} | {user.age} лет\n"
+        f"Данные: {gender_emoji} | <b>{user.age} лет</b>\n"
         f"⭐️ Рейтинг: <b>{user.rating:.1f}/5.0</b>\n"
         f"⚡️ Статус: <b>{status}</b>\n"
-        f"🎯 Поиск: <b>{filter_text}</b>\n\n"
-        f"🔗 <b>Ваша ссылка:</b>\n<code>{ref_link}</code>\n"
+        f"🎯 Ищу: <b>{filter_text}</b>\n\n"
+        f"🔗 <b>Реферальная ссылка:</b>\n<code>{ref_link}</code>\n\n"
         f"<i>Приглашено друзей: {user.referrals_count}</i>"
     )
     
     builder = InlineKeyboardBuilder()
+
+    # Кнопки для ВСЕХ (общие настройки)
+    builder.button(text="⚙️ Изменить пол/возраст", callback_data="settings_gender")
+
     if is_vip:
-        builder.button(text="🎯 Настроить фильтр пола", callback_data="change_filter")
-        # Твоя кнопка смены ника тут же
-        builder.button(text=f"✏️ Изменить ник", callback_data="change_nickname")
-        builder.adjust(1)
+        # Кнопки только для VIP
+        builder.button(text="🎯 Фильтр поиска", callback_data="change_filter")
+        builder.button(text="✏️ Изменить ник", callback_data="change_nickname")
+    else:
+        # Кнопка-призыв для обычных пользователей
+        builder.button(text="👑 Получить VIP статус", callback_data="buy_vip_menu")
     
-    await message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup() if is_vip else None)
+    builder.adjust(1)
+    
+    # Теперь клавиатура отправится ВСЕМ, независимо от VIP
+    await message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
+    
 # Добавь хендлер для изменения фильтра
 @router.callback_query(F.data == "change_filter")
 async def change_filter_menu(callback: CallbackQuery):
@@ -252,8 +259,8 @@ async def pay_via_card(callback: CallbackQuery, state: FSMContext):
     text = (
         "💳 <b>Оплата переводом на карту</b>\n\n"
         "Переведите <b>150 рублей</b> по номеру карты:\n"
-        "<code>2202 2000 1234 5678</code> (Сбер / Т-Банк)\n"
-        "Получатель: <i>Александр А.</i>\n\n"
+        "<code>4400 4303 8983 0552</code>\n"
+        #"Получатель: <i></i>\n\n"
         "📸 <b>Сразу после перевода отправьте скриншот чека (фото) или PDF-файл в этот чат.</b>\n"
         "<i>Или нажмите /start для отмены.</i>"
     )
@@ -368,7 +375,7 @@ async def process_successful_payment(message: Message, session: AsyncSession, bo
 # ==========================================
 # МЕНЮ НАСТРОЕК
 # ==========================================
-@router.message(F.text == "⚙️ Настройки", ChatState.menu)
+@router.message(F.text.in_({"⚙️ Настройки", "Настройки"}), ChatState.menu)
 async def show_settings(message: Message, session: AsyncSession):
     user, _ = await get_or_create_user(session, message.from_user.id)
     
@@ -402,16 +409,32 @@ async def change_gender_start(callback: CallbackQuery, state: FSMContext):
 async def process_new_gender(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
     new_gender = callback.data.split("_")[1]
     
-    # 1. Обновляем в PostgreSQL
+    # 1. Обновляем в БД
     user, _ = await get_or_create_user(session, callback.from_user.id)
     user.gender = new_gender
     await session.commit()
     
-    # 2. Обновляем в кэше Redis (ВАЖНО для матчмейкера!)
+    # 2. Обновляем Redis (важно для поиска)
+    from app.services.matchmaker import redis_client
     await redis_client.hset(f"user_prefs:{callback.from_user.id}", "g", new_gender)
     
+    # 3. Сбрасываем состояние
     await state.set_state(ChatState.menu)
-    await callback.message.edit_text(f"✅ Ваш пол успешно изменен!")
+    
+    # --- ИСПРАВЛЕНИЕ ТУТ ---
+    # Удаляем старое инлайн-сообщение настроек, чтобы не мусорить
+    await callback.message.delete()
+    
+    # Отправляем НОВОЕ сообщение с главной клавиатурой
+    await callback.message.answer(
+        f"✅ Ваш пол успешно изменен на <b>{'Парень' if new_gender == 'M' else 'Девушка'}</b>!",
+        parse_mode="HTML",
+        reply_markup=get_main_kb() # Теперь эта клавиатура применится корректно
+    )
+    # -----------------------
+    
+    # Не забываем ответить на сам callback, чтобы убрать "часики" в Telegram
+    await callback.answer()
 
 # --- ИЗМЕНЕНИЕ ВОЗРАСТА ---
 @router.callback_query(F.data == "settings_age")
