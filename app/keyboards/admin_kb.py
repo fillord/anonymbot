@@ -7,8 +7,10 @@ def get_admin_main_kb() -> InlineKeyboardMarkup:
     builder.button(text="🔨 Выдать БАН", callback_data="admin_ban")
     builder.button(text="🔓 Разбанить", callback_data="admin_unban")
     builder.button(text="👑 Выдать VIP", callback_data="admin_vip")
+    builder.button(text="📢 Рассылка", callback_data="admin_broadcast") # <--- НОВАЯ КНОПКА
     builder.button(text="❌ Отмена", callback_data="admin_cancel")
-    builder.adjust(1, 2, 2) # 1 кнопка в 1 ряду, 2 во втором, 1 в третьем
+    # Красивая раскладка: 1 кнопка, 2 в ряд, 2 в ряд, 1 внизу
+    builder.adjust(1, 2, 2, 1) 
     return builder.as_markup()
 
 def get_admin_cancel_kb() -> InlineKeyboardMarkup:

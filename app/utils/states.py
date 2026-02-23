@@ -4,8 +4,21 @@ class ChatState(StatesGroup):
     menu = State()         # Находится в главном меню
     searching = State()    # Встал в очередь, ждет
     in_chat = State()      # Общается с собеседником (или ИИ)
+    waiting_for_receipt = State()
+    waiting_for_nickname = State()
+    waiting_for_search_gender = State()
 
 class AdminState(StatesGroup):
     waiting_for_ban_id = State()
     waiting_for_vip_id = State()
     waiting_for_unban_id = State()
+    waiting_for_broadcast_msg = State()
+
+class RegState(StatesGroup):
+    gender = State()
+    age = State()
+
+class SettingsState(StatesGroup):
+    waiting_for_gender = State()
+    waiting_for_age = State()
+    

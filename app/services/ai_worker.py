@@ -5,11 +5,14 @@ from app.services.matchmaker import redis_client
 from app.keyboards.chat_kb import get_in_chat_kb
 from app.utils.states import ChatState
 from app.services.ai_client import clear_ai_context
+from app.utils.name_generator import generate_random_name
 
 async def ai_fallback_worker(bot, storage):
     while True:
         try:
-            for queue_name in ["queue:vip", "queue:normal"]:
+            # Получаем все активные очереди
+            _, queues = await redis_client.scan(cursor=0, match='queue:*:*', count=100)
+            for queue_name in queues:
                 user_id = await redis_client.lindex(queue_name, 0)
                 
                 if user_id:
@@ -27,6 +30,15 @@ async def ai_fallback_worker(bot, storage):
                         # --- ИСПРАВЛЕНИЕ БАГА: Принудительно меняем FSM-стейт на "в чате" ---
                         state_key = StorageKey(bot_id=bot.id, chat_id=int(user_id), user_id=int(user_id))
                         await storage.set_state(key=state_key, state=ChatState.in_chat)
+                        
+                        await clear_ai_context(int(user_id))
+                        # Подключаем ИИ в Redis
+                        await redis_client.set(f"chat:{user_id}", "AI")
+                        await redis_client.sadd("ai_chats", user_id)
+                        
+                        # --- ДАЕМ ИМЯ ИИ ---
+                        ai_name = generate_random_name()
+                        await redis_client.setex(f"display_name:AI_{user_id}", 86400, ai_name)
                         
                         await bot.send_message(
                             int(user_id), 

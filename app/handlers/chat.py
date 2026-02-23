@@ -1,5 +1,7 @@
-from aiogram import Router, F, Bot
 import os
+import datetime
+import re
+from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext, StorageKey
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,9 +9,11 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from app.utils.states import ChatState
 from app.keyboards.chat_kb import get_search_kb, get_in_chat_kb, get_rating_kb, get_report_reasons_kb
 from app.handlers.menu import get_main_kb
-from app.services.matchmaker import join_queue, leave_chat, is_in_chat, remove_from_queue
+from app.services.matchmaker import join_queue, leave_chat, is_in_chat, remove_from_queue, redis_client
 from app.database.db import get_or_create_user, update_user_rating, add_report_and_check_ban
 from app.services.ai_client import get_ai_response, clear_ai_context
+from app.utils.name_generator import generate_random_name
+
 router = Router()
 
 # ==========================================
@@ -20,12 +24,31 @@ async def start_search(message: Message, state: FSMContext, session: AsyncSessio
     await state.set_state(ChatState.searching)
     await message.answer("🔍 Ищем собеседника...", reply_markup=get_search_kb())
     
-    user = await get_or_create_user(session, message.from_user.id)
+    # Обновлено: get_or_create_user теперь возвращает 2 значения (user, ref_event)
+    user, _ = await get_or_create_user(session, message.from_user.id)
+    
     import datetime
     is_vip = user.vip_until and user.vip_until > datetime.datetime.utcnow()
     
-    # Теперь функция возвращает 2 значения
-    partner_id, was_ai = await join_queue(message.from_user.id, is_vip=is_vip)
+    # Защита от старых юзеров: берем пол и кого ищем из базы
+    user_gender = user.gender or "M"
+    search_gender = user.search_gender or "any"
+    
+    # --- НАЗНАЧАЕМ ИМЯ ДЛЯ ТЕКУЩЕГО ЧАТА ---
+    if is_vip and user.nickname:
+        display_name = user.nickname
+    else:
+        display_name = generate_random_name()
+    # Сохраняем имя в Redis на сутки (на случай долгих чатов)
+    await redis_client.setex(f"display_name:{message.from_user.id}", 86400, display_name)
+
+    # Вызываем обновленный матчмейкер с фильтрами пола
+    partner_id, was_ai = await join_queue(
+        message.from_user.id, 
+        is_vip=is_vip, 
+        user_gender=user_gender, 
+        search_gender=search_gender
+    )
     
     if partner_id:
         # Обязательно переводим ТЕКУЩЕГО пользователя в режим чата
@@ -134,17 +157,13 @@ async def init_report(message: Message, state: FSMContext, bot: Bot):
 # ==========================================
 @router.callback_query(F.data.startswith("rep_"))
 async def process_report_reason(callback: CallbackQuery, session: AsyncSession, bot: Bot):
-    # 1. МГНОВЕННО отвечаем, чтобы кнопка не висела "в раздумьях"
-    await callback.answer("Жалоба принята")
+    await callback.answer("Жалоба обрабатывается...")
     
-    # Разбираем данные: rep_причина_IDнарушителя
     data = callback.data.split("_")
     reason = data[1]
     reported_id = int(data[2])
     reporter_id = callback.from_user.id
     
-    # 2. Логика прогрессивного бана (в секундах)
-    # 1 жалоба = 5 мин, 2 = 30 мин, 3 = 2 часа, 4 = 1 день, 5 = навсегда
     ban_times = {
         10: 5 * 60,
         15: 30 * 60,
@@ -152,52 +171,46 @@ async def process_report_reason(callback: CallbackQuery, session: AsyncSession, 
         25: 1440 * 60
     }
     
-    # Вызываем обновленную функцию из БД (создадим её ниже)
     ban_info = await add_report_and_check_ban(session, reported_id, reporter_id, reason, ban_times)
     
-    # 3. Уведомляем админов
+    # Уведомляем админов
     admin_ids = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
     for admin_id in admin_ids:
         try:
-            status = f"🚫 ЗАБАНЕН на {ban_info['duration']} мин." if ban_info['is_banned'] else "⚠️ Предупреждение"
+            status = f"🚫 ЗАБАНЕН на {ban_info.get('duration', 0)} мин." if ban_info['is_banned'] else "⚠️ Предупреждение"
             if ban_info.get('permanent'): status = "🚫 ВЕЧНЫЙ БАН"
-            
             await bot.send_message(
                 admin_id,
-                f"🚨 <b>Жалоба!</b>\n"
-                f"На кого: <code>{reported_id}</code>\n"
-                f"Причина: {reason}\n"
-                f"Статус: {status}",
+                f"🚨 <b>Жалоба!</b>\nНа кого: <code>{reported_id}</code>\nПричина: {reason}\nСтатус: {status}",
                 parse_mode="HTML"
             )
         except: pass
 
-    await callback.message.edit_text("✅ Спасибо! Жалоба отправлена модераторам.")
-
-        
-    # Убираем инлайн-кнопки
+    # Убираем инлайн-кнопки (один раз!)
     await callback.message.edit_text("✅ Спасибо. Жалоба отправлена модераторам. Собеседник получил предупреждение.")
-    await callback.answer()
     
-    # Если юзер был только что забанен - уведомляем его (если он не заблокировал бота)
-    if was_banned:
+    # ИСПРАВЛЕНИЕ: Используем ban_info вместо несуществующей was_banned
+    if ban_info.get('is_banned'):
         try:
             await bot.send_message(
                 reported_id,
-                "🚫 <b>Ваш аккаунт заблокирован!</b>\n"
-                "Вы получили слишком много жалоб от собеседников. Доступ к поиску ограничен на 7 дней.",
+                "🚫 <b>Ваш аккаунт заблокирован!</b>\nВы получили слишком много жалоб. Доступ временно ограничен.",
                 parse_mode="HTML",
-                reply_markup=get_main_kb() # Сбрасываем клавиатуру
+                reply_markup=get_main_kb()
             )
-            # В идеале здесь же нужно принудительно выкинуть его из очереди через Redis,
-            # если он успел встать в новый поиск:
-            # await remove_from_queue(reported_id)
+            # Принудительно кикаем из поиска
+            from app.services.matchmaker import remove_from_queue
+            await remove_from_queue(reported_id)
         except Exception:
-            pass # Юзер мог заблокировать бота, просто игнорируем
+            pass
 
 # ==========================================
 # 3. МАРШРУТИЗАЦИЯ СООБЩЕНИЙ
 # ==========================================
+
+SPAM_PATTERN = re.compile(r"(https?://\S+|www\.\S+|t\.me/\S+|@\w+)", re.IGNORECASE)
+
+
 @router.message()
 async def route_message(message: Message, state: FSMContext, bot: Bot, session: AsyncSession):
     user_id = message.from_user.id
@@ -213,64 +226,108 @@ async def route_message(message: Message, state: FSMContext, bot: Bot, session: 
     current_state = await state.get_state()
     if current_state != ChatState.in_chat.state:
         await state.set_state(ChatState.in_chat)
-        
+    
+    # ==========================================
+    # 🛑 АНТИСПАМ-ФИЛЬТР
+    # ==========================================
+    text_to_check = message.text or message.caption
+    if text_to_check and SPAM_PATTERN.search(text_to_check):
+        await message.answer(
+            "🚫 <b>Отправка ссылок запрещена!</b>\nВ целях безопасности мы блокируем любые ссылки и Telegram-юзернеймы.", 
+            parse_mode="HTML"
+        )
+        return # Прерываем выполнение, сообщение не уйдет собеседнику
+
     # ==========================================
     # ФИЛЬТРАЦИЯ КОНТЕНТА (VIP СИСТЕМА)
     # ==========================================
-    # Разрешено обычным пользователям: текст, стикеры, голосовые
-    allowed_for_all = ['text', 'sticker', 'voice']
+    allowed_for_all = ['text', 'sticker', 'voice', 'animation'] # Добавили гифки
     
     if message.content_type not in allowed_for_all:
-        # Проверяем, есть ли у пользователя VIP
         user = await get_or_create_user(session, user_id)
         import datetime
         is_vip = user.vip_until and user.vip_until > datetime.datetime.utcnow()
         
         if not is_vip:
-            # 1. Получаем юзернейм бота для реферальной ссылки
             bot_info = await bot.get_me()
             ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+            share_url = f"https://t.me/share/url?url={ref_link}&text=Привет! Заходи общаться анонимно!"
             
-            # Ссылка для кнопки "Поделиться" (откроет выбор чата в Telegram)
-            share_url = f"https://t.me/share/url?url={ref_link}&text=Привет! Заходи общаться анонимно в этом крутом боте!"
-            
-            # 2. Собираем инлайн-кнопки
             builder = InlineKeyboardBuilder()
             builder.button(text="💎 Купить VIP", callback_data="buy_vip_menu")
             builder.button(text="🔗 Отправить другу", url=share_url)
-            builder.adjust(1) # Кнопки будут друг под другом
+            builder.adjust(1)
             
-            # 3. Отправляем сообщение с кнопками и удобной ссылкой для копирования
             await message.answer(
                 "⭐️ <b>Медиафайлы доступны только VIP!</b>\n\n"
-                "Отправка фото, видео, кружочков и файлов доступна только обладателям VIP-статуса.\n\n"
-                "<i>Пригласите 5 друзей или приобретите VIP, чтобы снять ограничения!</i>\n\n"
-                f"🔗 Ваша ссылка для копирования:\n<code>{ref_link}</code>",
+                "Отправка фото, видео, кружочков и файлов доступна только обладателям VIP.\n\n"
+                f"🔗 Ваша ссылка для приглашения 5 друзей:\n<code>{ref_link}</code>",
                 parse_mode="HTML",
                 reply_markup=builder.as_markup()
             )
-            return # Прерываем выполнение
+            return 
 
     # ==========================================
-    # ОТПРАВКА СООБЩЕНИЯ
+    # ОТПРАВКА СООБЩЕНИЯ С ИМЕНЕМ
     # ==========================================
+    # Получаем имя отправителя
+    sender_name = await redis_client.get(f"display_name:{user_id}") or "Аноним"
+    prefix = f"👤 <b>{sender_name}</b>:\n"
+    
     if partner_id == "AI":
         await bot.send_chat_action(chat_id=user_id, action="typing")
-        
-        # ИИ понимает только текст. Если юзер отправил стикер или голосовое, 
-        # вытаскиваем текст или делаем заглушку, чтобы ИИ не сломался.
         text_to_ai = message.text or message.caption or "отправил медиа/стикер"
         
         from app.services.ai_client import get_ai_response
         ai_reply = await get_ai_response(user_id, text_to_ai)
-        await message.answer(ai_reply)
+        
+        # Получаем имя ИИ
+        ai_name = await redis_client.get(f"display_name:AI_{user_id}") or "Собеседник"
+        await message.answer(f"👤 <b>{ai_name}</b>:\n{ai_reply}", parse_mode="HTML")
+        
     else:
         try:
-            # Пересылаем сообщение как копию (чтобы не было видно от кого)
-            await message.send_copy(chat_id=int(partner_id))
-        except Exception:
+            original_text = message.html_text or ""
+            new_text = prefix + original_text if original_text else prefix
+            
+            # Удаление EXIF из файлов
+            if message.content_type == 'document' and message.document.mime_type and message.document.mime_type.startswith('image/'):
+                file_info = await bot.get_file(message.document.file_id)
+                file_bytes_io = await bot.download_file(file_info.file_path)
+                from app.utils.security import strip_exif_data
+                safe_bytes = strip_exif_data(file_bytes_io.read())
+                
+                from aiogram.types import BufferedInputFile
+                input_file = BufferedInputFile(safe_bytes, filename=message.document.file_name or "safe_image.jpg")
+                await bot.send_document(chat_id=int(partner_id), document=input_file, caption=new_text, parse_mode="HTML")
+            
+            # Маршрутизация по типам контента
+            elif message.content_type == 'text':
+                await bot.send_message(chat_id=int(partner_id), text=new_text, parse_mode="HTML")
+            elif message.content_type == 'photo':
+                await bot.send_photo(chat_id=int(partner_id), photo=message.photo[-1].file_id, caption=new_text, parse_mode="HTML")
+            elif message.content_type == 'video':
+                await bot.send_video(chat_id=int(partner_id), video=message.video.file_id, caption=new_text, parse_mode="HTML")
+            elif message.content_type == 'voice':
+                await bot.send_voice(chat_id=int(partner_id), voice=message.voice.file_id, caption=new_text, parse_mode="HTML")
+            elif message.content_type == 'video_note': 
+                await bot.send_message(chat_id=int(partner_id), text=prefix, parse_mode="HTML")
+                await bot.send_video_note(chat_id=int(partner_id), video_note=message.video_note.file_id)
+            else:
+                # Только для стикеров и GIF-ок
+                await bot.send_message(chat_id=int(partner_id), text=prefix, parse_mode="HTML")
+                await message.send_copy(chat_id=int(partner_id))
+                
+        except Exception as e:
+            import logging
+            logging.error(f"Routing error: {e}")
             await leave_chat(user_id)
-            await notify_partner_disconnect(bot, state.storage, str(user_id), int(partner_id))
+            
+            await bot.send_message(int(partner_id), "Собеседник отключился.", reply_markup=get_main_kb())
+            from aiogram.fsm.storage.base import StorageKey
+            state_key = StorageKey(bot_id=bot.id, chat_id=int(partner_id), user_id=int(partner_id))
+            await state.storage.set_state(key=state_key, state=ChatState.menu)
+            
             await message.answer("Собеседник отключился.", reply_markup=get_main_kb())
 
 # ==========================================

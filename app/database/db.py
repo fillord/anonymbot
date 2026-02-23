@@ -3,11 +3,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.models import Report, User
 import datetime
 
-async def get_or_create_user(session: AsyncSession, telegram_id: int, referrer_id: int = None) -> User:
+async def get_or_create_user(session: AsyncSession, telegram_id: int, referrer_id: int = None):
     result = await session.execute(select(User).where(User.telegram_id == telegram_id))
     user = result.scalar_one_or_none()
+    
+    referral_event = None # Сюда запишем данные, если был приглашен друг
 
-    # Если пользователя НЕТ в базе - создаем и засчитываем реферала
     if not user:
         user = User(
             telegram_id=telegram_id,
@@ -15,26 +16,30 @@ async def get_or_create_user(session: AsyncSession, telegram_id: int, referrer_i
         )
         session.add(user)
         
-        # Логика реферальной системы
+        # ЛОГИКА РЕФЕРАЛОВ: 5 приглашений, затем каждые 3 (8, 11, 14...) = VIP на 3 дня
         if referrer_id and referrer_id != telegram_id:
             ref_result = await session.execute(select(User).where(User.telegram_id == referrer_id))
             referrer = ref_result.scalar_one_or_none()
             
             if referrer:
                 referrer.referrals_count += 1
+                count = referrer.referrals_count
                 
-                # Каждые 5 приглашенных = VIP на 3 дня
-                if referrer.referrals_count % 5 == 0:
+                # Проверка: 5-й реферал ИЛИ (больше 5 и шаг 3)
+                if count == 5 or (count > 5 and (count - 5) % 3 == 0):
                     now = datetime.datetime.utcnow()
-                    # Если VIP уже есть, просто продлеваем его. Если нет - даем от текущего времени
                     current_vip = referrer.vip_until if (referrer.vip_until and referrer.vip_until > now) else now
                     referrer.vip_until = current_vip + datetime.timedelta(days=3)
+                    referral_event = {"id": referrer_id, "count": count, "bonus": True}
+                else:
+                    referral_event = {"id": referrer_id, "count": count, "bonus": False}
                     
         await session.commit()
-    return user
+        
+    return user, referral_event
 
 async def update_user_rating(session: AsyncSession, user_id: int, score: int):
-    user = await get_or_create_user(session, user_id)
+    user, _ = await get_or_create_user(session, user_id)
     # Формула пересчета среднего значения
     new_rating = ((user.rating * user.rating_count) + score) / (user.rating_count + 1)
     

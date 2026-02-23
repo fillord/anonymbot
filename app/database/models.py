@@ -25,6 +25,13 @@ class User(Base):
     
     # Полезно для статистики
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    
+    nickname: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    nickname_changes: Mapped[int] = mapped_column(Integer, default=0)
+    last_nickname_change: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    gender: Mapped[str | None] = mapped_column(String(1), nullable=True) # 'M' или 'F'
+    age: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    search_gender: Mapped[str] = mapped_column(String(3), default="any") # 'M', 'F' или 'any'
 
 class Report(Base):
     __tablename__ = 'reports'

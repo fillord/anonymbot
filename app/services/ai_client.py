@@ -8,56 +8,52 @@ from app.services.matchmaker import redis_client
 # Инициализируем новый клиент
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-SYSTEM_PROMPT = """Ты — случайный анонимный собеседник в Telegram чат-рулетке.
-Тебе 20-25 лет. Общайся коротко (1-2 предложения), естественно, как обычный человек в мессенджере.
-Используй сленг, иногда можешь писать без заглавных букв. Никакого официоза.
-Никогда не признавайся, что ты ИИ, языковая модель или бот. Ты живой человек! Если спрашивают — переводи тему, шути или возмущайся.
-Не будь слишком вежливым, поддерживай живой и немного небрежный стиль."""
+SYSTEM_PROMPT = """Ты — обычный случайный собеседник в Telegram чат-рулетке. Тебе 22 года.
+Твоя задача — общаться максимально естественно, как живой человек с телефона.
+
+ЖЕСТКИЕ ПРАВИЛА:
+1. НИКОГДА не пиши длинные тексты. Отвечай 1-2 короткими предложениями.
+2. НИКОГДА не используй списки, пункты или идеальное форматирование.
+3. НИКОГДА не признавайся, что ты бот, ИИ или нейросеть. Ты — человек! Если обвиняют, что ты бот — отвечай с сарказмом (например: "сам ты бот лол").
+4. Пиши с маленькой буквы, иногда игнорируй знаки препинания. Используй сленг (че, норм, лол, хз, прикол).
+5. На вопрос "м/ж", "пол" или "ты кто" отвечай рандомно: либо парень, либо девушка, но держи эту роль до конца чата.
+6. На вопрос "откуда" или "гдe живешь" называй случайный реальный город СНГ.
+7. Не будь слишком вежливым или услужливым. Можешь слегка дерзить, скучать или менять тему.
+8. Если собеседник пишет бред или агрессирует — отвечай коротко (например: "мда", "понятно", "ясно") или шути."""
 
 async def get_ai_response(user_id: int, text: str) -> str:
     redis_key = f"ai_context:{user_id}"
-    
-    # 1. Достаем историю диалога из Redis
     history_data = await redis_client.lrange(redis_key, 0, -1)
     
     contents = []
     for item in history_data:
         msg = json.loads(item)
-        # В новом SDK роли называются "user" и "model"
         role = "model" if msg["role"] == "assistant" else "user"
         contents.append(
             types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])])
         )
         
-    # 2. Добавляем текущее сообщение пользователя
-    contents.append(
-        types.Content(role="user", parts=[types.Part.from_text(text=text)])
-    )
+    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=text)]))
     
-    # 3. Запрос к новой API
     try:
         response = await client.aio.models.generate_content(
-            model='gemini-2.5-flash', # Используем актуальную модель
+            model='gemini-2.5-flash', # Обновлено до 2.0-flash
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
-                temperature=0.8,
+                temperature=0.85, # Чуть повышаем температуру для разнообразия ответов
             )
         )
         ai_text = response.text
     except Exception as e:
-        # Теперь ошибка 100% отобразится в pm2 logs
         logging.error(f"Gemini API Error: {e}")
-        ai_text = "блин, инет лагает... что ты сказал?"
+        ai_text = "инет тупит чет, не понял тебя"
         
-    # 4. Сохраняем новое сообщение юзера и ответ ИИ в Redis
     user_msg = {"role": "user", "content": text}
     ai_msg = {"role": "assistant", "content": ai_text}
     
     await redis_client.rpush(redis_key, json.dumps(user_msg))
     await redis_client.rpush(redis_key, json.dumps(ai_msg))
-    
-    # 5. Храним только последние 12 сообщений
     await redis_client.ltrim(redis_key, -12, -1)
     
     return ai_text
