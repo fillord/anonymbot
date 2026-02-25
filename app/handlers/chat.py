@@ -244,7 +244,7 @@ async def route_message(message: Message, state: FSMContext, bot: Bot, session: 
     allowed_for_all = ['text', 'sticker', 'voice', 'animation'] # Добавили гифки
     
     if message.content_type not in allowed_for_all:
-        user = await get_or_create_user(session, user_id)
+        user, _ = await get_or_create_user(session, user_id)
         import datetime
         is_vip = user.vip_until and user.vip_until > datetime.datetime.utcnow()
         
